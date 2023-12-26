@@ -1,6 +1,7 @@
 @file:OptIn(ExperimentalForeignApi::class)
 
-import kotlinx.cinterop.*
+import kotlinx.cinterop.CPointer
+import kotlinx.cinterop.ExperimentalForeignApi
 import platform.posix.*
 
 fun main(args: Array<String>) {
@@ -8,105 +9,123 @@ fun main(args: Array<String>) {
     val options = inputOptions.ifEmpty {
         listOf("-c", "-l", "-w")
     }
-    filePaths.forEach { filePath ->
-        val results: List<Number> = options.map { option ->
-            when (option) {
-                "-c" -> {
-                    // number of bytes in file
-                    bytesInFile(filePath)
-                }
-
-                "-l" -> {
-                    // number of lines in file
-                    linesInFile(filePath)
-                }
-
-                "-w" -> {
-                    // number of words in file
-                    wordsInFile(filePath)
-                }
-
-                "-m" -> {
-                    // number of characters in file
-                    // TODO: multibyte chars
-                    charsInFile(filePath)
-                }
-
-                else -> throw IllegalArgumentException("Invalid option specified: $option")
-            }
+    filePaths.asSequence()
+        .map { filePath ->
+            Input.File({ fopen(filePath, "r") }, filePath)
         }
-        println("${results.joinToString(separator = " ")} $filePath")
+        .ifEmpty {
+            // TODO process multiple options for stdin
+            sequenceOf(Input.StdIn { stdin })
+        }
+        .forEach { input ->
+            val results: List<Number> = options.map { option ->
+                val fPointer = input.fPointer() ?: return
+                try {
+                    when (option) {
+                        "-c" -> {
+                            // number of bytes in file
+                            bytesInFile(fPointer)
+                        }
+
+                        "-l" -> {
+                            // number of lines in file
+                            linesInFile(fPointer)
+                        }
+
+                        "-w" -> {
+                            // number of words in file
+                            wordsInFile(fPointer)
+                        }
+
+                        "-m" -> {
+                            // number of characters in file
+                            charsInFile(fPointer)
+                        }
+
+                        else -> throw IllegalArgumentException("Invalid option specified: $option")
+                    }
+                } finally {
+                    fclose(fPointer)
+                }
+            }
+            input.print(results)
+        }
+}
+
+sealed class Input {
+    abstract val fPointer: () -> CPointer<FILE>?
+    abstract fun print(results: List<Number>)
+
+    data class File(
+        override val fPointer: () -> CPointer<FILE>?,
+        val filePath: String,
+    ) : Input() {
+        override fun print(results: List<Number>) {
+            println("${results.joinToString(separator = " ")} $filePath")
+        }
+    }
+
+    data class StdIn(
+        override val fPointer: () -> CPointer<FILE>?,
+    ) : Input() {
+        override fun print(results: List<Number>) {
+            println(results.joinToString(separator = " "))
+        }
     }
 }
 
 fun getOptions(args: Array<String>): Pair<List<String>, List<String>> = args.partition { it.startsWith("-") }
 
-fun bytesInFile(filePath: String): Long {
-    return memScoped {
-        val statResult = alloc<stat>()
-        val result = stat(filePath, statResult.ptr)
-        if (result == 0) {
-            statResult.st_size
-        } else {
-            throw RuntimeException("Failed to find size of file $filePath")
-        }
-    }.toLong()
+fun bytesInFile(fPointer: CPointer<FILE>): Int {
+    var charCount = 0
+    var c = fgetc(fPointer)
+    while (c != EOF) {
+        charCount++
+        c = fgetc(fPointer)
+    }
+    return charCount
 }
 
-fun linesInFile(filePath: String): Int {
-    return doFileOperation(filePath) { file ->
-        var lines = 0
-        var c = fgetc(file)
-        while (c != EOF) {
-            if (c == '\n'.code) {
-                lines++
-            }
-            c = fgetc(file)
+fun linesInFile(fPointer: CPointer<FILE>): Int {
+    var lineCount = 0
+    var c = fgetc(fPointer)
+    while (c != EOF) {
+        if (c == '\n'.code) {
+            lineCount++
         }
-        lines
+        c = fgetc(fPointer)
     }
+    return lineCount
 }
 
-fun wordsInFile(filePath: String): Int {
-    return doFileOperation(filePath) { file ->
-        var words = 0
-        var c = fgetc(file)
-        var inWord = false
-        while (c != EOF) {
-            if (c.isCountableChar() && !inWord) {
-                inWord = true
-            } else if (!c.isCountableChar() && inWord) {
-                words++
-                inWord = false
-            }
-            c = fgetc(file)
+fun wordsInFile(fPointer: CPointer<FILE>): Int {
+    var wordCount = 0
+    var c = fgetc(fPointer)
+    var inWord = false
+    while (c != EOF) {
+        if (c.isCountableChar() && !inWord) {
+            inWord = true
+        } else if (!c.isCountableChar() && inWord) {
+            wordCount++
+            inWord = false
         }
-        if (inWord) {
-            words++
-        }
-        words
+        c = fgetc(fPointer)
     }
+    if (inWord) {
+        wordCount++
+    }
+    return wordCount
 }
 
-fun charsInFile(filePath: String): Int {
-    return doFileOperation(filePath) { file ->
-        var chars = 0
-        var c = fgetwc(file)
-        while (c != WEOF) {
-            chars++
-            c = fgetwc(file)
-        }
-        chars
+fun charsInFile(fPointer: CPointer<FILE>): Int {
+    setlocale(LC_ALL, "en_US.utf8")
+    var charCount = 0
+    var c = fgetwc(fPointer)
+    while (c != WEOF) {
+        charCount++
+        c = fgetwc(fPointer)
     }
-}
-
-fun doFileOperation(filePath: String, operation: (CPointer<FILE>) -> Int): Int {
-    val file = fopen(filePath, "r") ?: throw IllegalArgumentException("Unable to open file $filePath")
-    return try {
-        operation(file)
-    } finally {
-        fclose(file)
-    }
+    return charCount
 }
 
 fun Int.isCountableChar() = this != ' '.code && this != '\n'.code && this != '\t'.code
